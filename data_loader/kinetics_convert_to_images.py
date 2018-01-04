@@ -58,7 +58,7 @@ for cat_id, categories_dir in enumerate(categories_dirs):
             os.makedirs(video_im_dir)
 
         # Open the video and set resizing option
-        video = VideoReaderOpenCV(video_file, as_float=False, resize_max_dim=resize_small_side)
+        video = VideoReaderOpenCV(video_file, as_float=False, resize_small_side=resize_small_side)
 
         # Do we already have all the frames?
         images = glob.glob(os.path.join(video_im_dir, "*.jpg"))
