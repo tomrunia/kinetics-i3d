@@ -16,6 +16,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import time
+import datetime
+
 import tensorflow as tf
 import cv2
 
@@ -23,11 +26,11 @@ import cv2
 SEQ_NUM_FRAMES = 64
 CROP_SIZE = 224
 RANDOM_LEFT_RIGHT_FLIP = True
-BATCH_SIZE = 64
+BATCH_SIZE = 20
 NUM_EPOCHS = 100
 
 
-def decode(serialized_example, sess):
+def decode(serialized_example):
     '''
     Given a serialized example in which the frames are stored as
     compressed JPG images 'frames/0001', 'frames/0002' etc., this
@@ -56,9 +59,6 @@ def decode(serialized_example, sess):
     # Pack the frames into one big tensor of shape (N,H,W,3)
     images = tf.stack(images)
     label  = tf.cast(parsed_features['class_label'], tf.int64)
-
-    # Randomly sample offset ... ? Need to produce strings for dict indices after this
-    # offset = tf.random_uniform(shape=(), minval=0, maxval=label, dtype=tf.int64)
 
     return images, label
 
@@ -100,8 +100,11 @@ def preprocess_video(images, label):
                          lambda: video_left_right_flip(images),
                          lambda: tf.identity(images))
 
+
+    # NOTE: enabling this, makes the data pipeline much slower
+    #       Drops from ~30 examples p/sec to ~10 examples p/sec
     # Normalization: [0, 255] => [-0.5, +0.5] floats
-    images = tf.cast(images, tf.float32) * (1./255.) - 0.5
+    #images = tf.cast(images, tf.float32) * (1./255.) - 0.5
     return images, label
 
 
@@ -111,36 +114,50 @@ if  __name__ == "__main__":
     tfrecord_files = glob.glob("/home/tomrunia/data/Kinetics/Full/tfrecords/val/*.tfrecords")
     tfrecord_files.sort()
 
-    sess = tf.Session()
+    options = tf.ConfigProto(log_device_placement=True)
+    sess = tf.Session(config=options)
+
     init_op = tf.group(
         tf.global_variables_initializer(),
         tf.local_variables_initializer())
 
-    dataset = tf.data.TFRecordDataset(tfrecord_files)
+    with tf.device('/cpu:0'):
 
-    dataset = dataset.repeat(NUM_EPOCHS)
-    dataset = dataset.map(decode)
-    dataset = dataset.map(preprocess_video)
+        dataset = tf.data.TFRecordDataset(tfrecord_files)
 
-    # The parameter is the queue size
-    dataset = dataset.shuffle(1000 + 3 * BATCH_SIZE)
-    dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.map(decode)
+        dataset = dataset.map(preprocess_video)
 
-    iterator = dataset.make_one_shot_iterator()
-    next_batch = iterator.get_next()
+        # This order reaches ~100 examples/second after cache warmup.
+        dataset = dataset.shuffle(buffer_size=500 +3*BATCH_SIZE)
+        dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.cache()
+        dataset = dataset.repeat(NUM_EPOCHS)
+
+        iterator = dataset.make_one_shot_iterator()
+        next_batch = iterator.get_next()
+        get_next_batch = sess.make_callable(next_batch)
 
     sess.run(init_op)
 
     while True:
 
-        # Fetch a new batch from the dataset
-        batch_videos, batch_labels = sess.run(next_batch)
+        t1 = time.time()
 
-        for sample_idx in range(BATCH_SIZE):
+        # Fetch a new batch from the dataset
+        batch_videos, batch_labels = get_next_batch()
+
+        # Only for time measurement of step through network
+        t2 = time.time()
+        examples_per_second = BATCH_SIZE / float(t2 - t1)
+
+        print("Batch size: {}. Speed: {:.1f} examples/second".format(BATCH_SIZE, examples_per_second))
+
+        for sample_idx in range(1):
             print("Class label = {}".format(batch_labels[sample_idx]))
             for frame_idx in range(SEQ_NUM_FRAMES):
                 cv2.imshow("image", batch_videos[sample_idx,frame_idx])
-                cv2.waitKey(20)
-            key = cv2.waitKey(0)
-            if key == ord('q'):
-                exit()
+                cv2.waitKey(5)
+            #key = cv2.waitKey(0)
+            #if key == ord('q'):
+            #    exit()
