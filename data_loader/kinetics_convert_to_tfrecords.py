@@ -18,6 +18,7 @@ from __future__ import print_function
 
 import os
 import glob
+import multiprocessing
 
 import numpy as np
 import tensorflow as tf
@@ -28,49 +29,10 @@ from cortex.vision.video_reader import VideoReaderOpenCV
 
 ################################################################################
 
-def _int64_feature(value):
-    """Wrapper for inserting int64 features into Example proto."""
-    if not isinstance(value, list):
-        value = [value]
-    return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
-
-def _bytes_feature(value):
-    """Wrapper for inserting bytes features into Example proto."""
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
-
-def convert_video_to_tfrecords(video_dir, example, resize_small_side=None):
-
-    print("Converting video to TFRecords: {}".format(example['video_id']))
-
-    # Build the full video file path
-    video_path = os.path.join(
-        video_dir, example['class_label'], "{}_{:06d}_{:06d}.mp4".format(
-            example['video_id'], example['frame_start'], example['frame_end']))
-
-    # Open the video and set resizing option
-    video = VideoReaderOpenCV(
-        video_path, as_float=False, resize_small_side=resize_small_side)
-
-    # Read all the frames into memory (resized)
-    frames = video.all_frames()
-
-    tf_example = tf.train.Example(features=tf.train.Features(feature={
-        'video/num_frames':  _int64_feature(frames.shape[0]),
-        'video/height':      _int64_feature(frames.shape[1]),
-        'video/width':       _int64_feature(frames.shape[2]),
-        'video/channels':    _int64_feature(frames.shape[3]),
-        'video/filename':    _bytes_feature(tf.compat.as_bytes(example['video_id'])),
-        'video/class_label': _int64_feature(example['class_id']),
-        'video/class_text':  _bytes_feature(tf.compat.as_bytes(example['class_label'])),
-        # Note the .tobytes() in the line below
-        'video/frames':      _bytes_feature(tf.compat.as_bytes(frames.tobytes()))}))
-
-    return tf_example
-
 def write_label_mapping(train_split_file, label_map_file):
     class_index = 1
     classes = []
-    f_train_split = open(split_list_file, 'r')
+    f_train_split = open(train_split_file, 'r')
     f_label_map   = open(label_map_file, 'w')
     f_train_split.readline()  # skip file header
     for line in f_train_split:
@@ -129,46 +91,132 @@ def read_example_list(split_list_file, label_mapping):
     print("Found {} examples.".format(len(examples)))
     return examples
 
+################################################################################
 
-def convert_kinetics_to_tfrecords(video_path, split_list_file, label_mapping_file,
-                                  output_path, max_dim_resize=256,
-                                  examples_per_file=20):
+def _int64_feature(value):
+    """Wrapper for inserting int64 features into Example proto."""
+    if not isinstance(value, list):
+        value = [value]
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
+
+def _bytes_feature(value):
+    """Wrapper for inserting bytes features into Example proto."""
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+def video_to_tfrecord(video_dir, example, resize_small_side=None):
+
+    # Build the full video file path
+    video_path = os.path.join(
+        video_dir, example['class_label'], "{}_{:06d}_{:06d}.mp4".format(
+            example['video_id'], example['frame_start'], example['frame_end']))
+
+    # For some examples the video could not be downloaded...
+    if not os.path.exists(video_path):
+        return None
+
+    # Open the video and set resizing option
+    try:
+
+        video = VideoReaderOpenCV(
+            video_path, as_float=False, resize_small_side=resize_small_side)
+
+    except ValueError:
+        print("WARNING - video is unreadable: {}".format(video_path))
+        return None
+
+    # Read all the frames into memory (resized)
+    frames = video.all_frames()
+
+    features = {}
+    features['num_frames']  = _int64_feature(frames.shape[0])
+    features['height']      = _int64_feature(frames.shape[1])
+    features['width']       = _int64_feature(frames.shape[2])
+    features['channels']    = _int64_feature(frames.shape[3])
+    features['filename']    = _bytes_feature(tf.compat.as_bytes(example['video_id']))
+    features['class_label'] = _int64_feature(example['class_id'])
+    for i in range(len(frames)):
+        ret, buffer = cv2.imencode(".jpg", frames[i])
+        features["frames/{:04d}".format(i)] = _bytes_feature(tf.compat.as_bytes(buffer.tobytes()))
+
+    tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+
+    print("  Num. Frames: {}, Dimension: {}x{}, Class: {}, Label: {}".format(
+        frames.shape[0], frames.shape[2], frames.shape[1],
+        example['class_id'], example['class_label']))
+
+    if frames.shape[0] < 64:
+        raise RuntimeWarning("Video length is smaller than 64 frames...")
+
+    return tf_example
+
+def write_video_batch_tfrecords(video_dir, examples, output_dir,
+                                examples_per_file, resize_small_side=None):
+
+    num_tfrecord_files = int(np.ceil(len(examples)/examples_per_file))
+    for tfrecord_idx in range(num_tfrecord_files):
+        num_existing = len(glob.glob(os.path.join(output_dir, '*.tfrecords')))
+        output_file = os.path.join(output_dir, "{:06d}.tfrecords".format(num_existing+1))
+        with tf.python_io.TFRecordWriter(output_file) as writer:
+            start = tfrecord_idx*examples_per_file
+            end   = start+examples_per_file
+            for i in range(start, min(end, len(examples))):
+                # Convert video to tfrecord and write it to tfrecords
+                example = video_to_tfrecord(video_dir, examples[i], resize_small_side)
+                if example is not None:
+                    writer.write(example.SerializeToString())
+
+
+def convert_kinetics_to_tfrecords(kinetics_path, split, output_path,
+                                  max_dim_resize=256, examples_per_file=20,
+                                  num_workers=10, limit_examples=None):
+
+    assert split in ('train', 'val', 'test')
+
+    # Setup directories
+    video_path = os.path.join(kinetics_path, "videos")
+    split_list_file = os.path.join(kinetics_path, "splits", "kinetics_{}.csv".format(split))
+    label_mapping_file = os.path.join(kinetics_path, "label_mapping.txt")
+
+    # Create output directory
+    output_path = os.path.join(output_path, split)
+    if not os.path.exists(output_path): os.mkdir(output_path)
 
     # Read label mapping from file
-    label_mapping = read_label_mapping(label_name_file)
+    label_mapping = read_label_mapping(label_mapping_file)
 
     # Read 'train', 'val' or 'test' split from CSV file
-    example_list = read_example_list(split_list_file, label_mapping)
+    examples = read_example_list(split_list_file, label_mapping)
 
-    num_tfrecord_files = int(np.ceil(len(example_list)/examples_per_file))
+    if limit_examples is not None:
+        examples = examples[0:limit_examples]
+
+    num_tfrecord_files = int(np.ceil(len(examples)/examples_per_file))
     example_idx_offset = 0
 
-    # Set tfrecords configuration, i.e. compression
-    options = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.GZIP)
+    examples_per_worker = len(examples) // (max(num_workers, 2)-1)
 
-    for tf_record_idx in range(num_tfrecord_files):
+    jobs = []
+    for worker_idx in range(num_workers):
+        start = worker_idx*examples_per_worker
+        end   = start+examples_per_worker
+        batch_examples = examples[start:end]
 
-        # Open a new TFRecords file
-        tfrecords_file_name = os.path.join(output_path, "{:06d}.tfrecords".format(tf_record_idx))
-        with tf.python_io.TFRecordWriter(tfrecords_file_name, options) as writer:
+        p = multiprocessing.Process(
+            target=write_video_batch_tfrecords,
+            args=(video_path, batch_examples, output_path,
+                  examples_per_file, resize_small_side,))
+        jobs.append(p)
+        p.start()
 
-            for i in range(example_idx_offset, min(example_idx_offset+examples_per_file, len(example_list))):
-                # Convert video to tfrecord and write it to tfrecords
-                example = convert_video_to_tfrecords(video_path, example_list[i], resize_small_side)
-                writer.write(example.SerializeToString())
 
-        # Prepare for next batch in tfrecords file
-        example_idx_offset += examples_per_file
-
+################################################################################
 
 if __name__ == "__main__":
 
     kinetics_path = "/home/tomrunia/data/Kinetics/Full/"
+    tfrecords_path = os.path.join(kinetics_path, "tfrecords")
 
-    video_path = os.path.join(kinetics_path, "videos")
-    label_name_file = os.path.join(kinetics_path, "label_mapping.txt")
-    split_list_file = os.path.join(kinetics_path, "splits/kinetics_train.csv")
-    tfrecords_path  = os.path.join(kinetics_path, "tfrecords")
+    split = 'val'
 
     # First step: build the label mapping
     #write_label_mapping(split_list_file, label_name_file)
@@ -177,7 +225,13 @@ if __name__ == "__main__":
     resize_small_side = 256
 
     # Number of examples per TFRecords file
-    examples_per_file = 25
+    examples_per_file = 100
+
+    # Number of parallel threads
+    number_of_workers = 10
+
+    # Process a subset of the dataset
+    limit_examples = 1000
 
     # Size computation of Kinetics dataset
     # Number of videos per tfrecords file
@@ -186,8 +240,5 @@ if __name__ == "__main__":
 
     # Even with tfrecord's GZIP compression this is 1.6 Terabytes !!
     convert_kinetics_to_tfrecords(
-        video_path, split_list_file, label_name_file,
-        tfrecords_path, resize_small_side, examples_per_file
-    )
-
-
+        kinetics_path, split, tfrecords_path, resize_small_side,
+        examples_per_file, number_of_workers, limit_examples)
